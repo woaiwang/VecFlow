@@ -9,7 +9,8 @@ function(vecflow_add_test TEST_NAME)
     add_executable(${TEST_NAME} ${TEST_NAME}.cpp)
     target_link_libraries(${TEST_NAME}
         PRIVATE
-            vecflow_core        # 我们自己的库（获得 include/ 路径）
+            vecflow_core        # 我们的头文件库（获得 include/ 路径）
+            vecflow_simd        # SIMD 实现（AVX2 kernels）
             GTest::gtest_main   # GTest 主函数（不需要自己写 main）
     )
     # 将测试注册到 CTest，这样 ctest 命令才能发现它
@@ -24,4 +25,7 @@ endfunction()
 # ---------------------------------------------------------------
 # 注册所有测试（每新增一个 .cpp 就加一行）
 # ---------------------------------------------------------------
-# vecflow_add_test(test_distance)    # Day3 写完 test_distance.cpp 后取消注释
+vecflow_add_test(test_types)
+vecflow_add_test(test_distance)
+vecflow_add_test(test_flat_index)
+vecflow_add_test(test_hnsw)
