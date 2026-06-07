@@ -1,0 +1,181 @@
+# 文件路径：VecFlow/.github/workflows/ci.yml
+
+name: CI
+
+# ---------------------------------------------------------------
+# 触发条件：
+#   push to main：合并代码时触发
+#   pull_request to main：提 PR 时触发（保护主分支）
+#   workflow_dispatch：允许在 GitHub 网页上手动触发
+# ---------------------------------------------------------------
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+# ---------------------------------------------------------------
+# 并发控制：同一分支有新 push 时，取消正在运行的旧 CI
+# 节省 GitHub Actions 免费额度
+# ---------------------------------------------------------------
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # =============================================================
+  # Job 1: 核心构建与测试矩阵
+  # 同时在 4 种环境下构建，确保代码的可移植性
+  # =============================================================
+  build-and-test:
+    name: "Build & Test | ${{ matrix.os }} | ${{ matrix.build_type }}"
+    
+    strategy:
+      fail-fast: false    # 某一个矩阵失败，不中断其他矩阵
+      matrix:
+        os: [ ubuntu-22.04, macos-14 ]
+        build_type: [ Debug, Release ]
+        # 矩阵展开后共 4 个并行 job：
+        # ubuntu-22.04/Debug, ubuntu-22.04/Release
+        # macos-14/Debug,     macos-14/Release
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      # ----------------------------------------------------------
+      # Step 1: 拉取代码
+      # ----------------------------------------------------------
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      # ----------------------------------------------------------
+      # Step 2: 配置编译器（Ubuntu 指定 GCC-12，macOS 用 AppleClang）
+      # ----------------------------------------------------------
+      - name: 🔧 Setup compiler (Ubuntu only)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-12 g++-12
+          # 将 gcc-12/g++-12 设为默认
+          sudo update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-12 100
+          sudo update-alternatives --install /usr/bin/g++ g++ /usr/bin/g++-12 100
+          echo "CC=gcc-12"   >> $GITHUB_ENV
+          echo "CXX=g++-12"  >> $GITHUB_ENV
+
+      # ----------------------------------------------------------
+      # Step 3: 缓存 CMake FetchContent 依赖
+      # 关键优化：把 GTest/GBenchmark 的下载结果缓存起来
+      # 命中缓存时，CI 速度从 3 分钟降到 30 秒
+      # ----------------------------------------------------------
+      - name: 💾 Cache CMake dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/_deps          # FetchContent 下载目录
+            ~/.cache/CPM         # 如果后续换 CPM 也能缓存
+          key: |
+            cmake-deps-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+          restore-keys: |
+            cmake-deps-${{ runner.os }}-
+
+      # ----------------------------------------------------------
+      # Step 4: CMake Configure
+      # ----------------------------------------------------------
+      - name: ⚙️ Configure CMake
+        run: |
+          cmake -B build \
+            -DCMAKE_BUILD_TYPE=${{ matrix.build_type }} \
+            -DVECFLOW_BUILD_TESTS=ON \
+            -DVECFLOW_BUILD_BENCHMARKS=OFF \
+            -DVECFLOW_ENABLE_ASAN=OFF
+
+      # ----------------------------------------------------------
+      # Step 5: 编译
+      # ----------------------------------------------------------
+      - name: 🔨 Build
+        run: cmake --build build --config ${{ matrix.build_type }} -j$(nproc 2>/dev/null || sysctl -n hw.ncpu)
+        # nproc 是 Linux 命令，macOS 用 sysctl -n hw.ncpu
+
+      # ----------------------------------------------------------
+      # Step 6: 运行测试
+      # ----------------------------------------------------------
+      - name: 🧪 Run tests
+        working-directory: build
+        run: ctest --build-config ${{ matrix.build_type }} --output-on-failure --timeout 60
+
+      # ----------------------------------------------------------
+      # Step 7: 上传测试报告（失败时便于诊断）
+      # ----------------------------------------------------------
+      - name: 📊 Upload test results on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.build_type }}
+          path: build/Testing/
+          retention-days: 7
+
+
+  # =============================================================
+  # Job 2: AddressSanitizer 内存检测（仅 Linux Debug）
+  # 独立 Job，不影响主构建矩阵的速度
+  # =============================================================
+  memory-check:
+    name: "Memory Check (ASan + UBSan)"
+    runs-on: ubuntu-22.04
+    # 只在主构建通过后才运行，节省资源
+    needs: build-and-test
+
+    steps:
+      - name: 📥 Checkout repository
+        uses: actions/checkout@v4
+
+      - name: 🔧 Setup GCC-12
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-12 g++-12
+          echo "CC=gcc-12"  >> $GITHUB_ENV
+          echo "CXX=g++-12" >> $GITHUB_ENV
+
+      - name: 💾 Cache CMake dependencies
+        uses: actions/cache@v4
+        with:
+          path: build-asan/_deps
+          key: cmake-deps-asan-${{ runner.os }}-${{ hashFiles('CMakeLists.txt') }}
+
+      - name: ⚙️ Configure with ASan
+        run: |
+          cmake -B build-asan \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DVECFLOW_BUILD_TESTS=ON \
+            -DVECFLOW_BUILD_BENCHMARKS=OFF \
+            -DVECFLOW_ENABLE_ASAN=ON
+
+      - name: 🔨 Build
+        run: cmake --build build-asan -j$(nproc)
+
+      - name: 🔍 Run tests under ASan
+        working-directory: build-asan
+        # ASAN_OPTIONS 设置：
+        #   halt_on_error=1：发现第一个错误立即退出
+        #   detect_leaks=1：开启内存泄漏检测
+        run: |
+          export ASAN_OPTIONS="halt_on_error=1:detect_leaks=1:print_stats=1"
+          export UBSAN_OPTIONS="halt_on_error=1:print_stacktrace=1"
+          ctest --output-on-failure --timeout 60
+
+
+  # =============================================================
+  # Job 3: 代码风格检查（可选，Week4 开启）
+  # 现在先注释掉，等项目成型后再加
+  # =============================================================
+  # lint:
+  #   name: "Code Style (clang-format)"
+  #   runs-on: ubuntu-22.04
+  #   steps:
+  #     - uses: actions/checkout@v4
+  #     - name: Check formatting
+  #       run: |
+  #         sudo apt-get install -y clang-format-15
+  #         find include/ src/ tests/ -name "*.cpp" -o -name "*.hpp" \
+  #           | xargs clang-format-15 --dry-run --Werror
